@@ -76,7 +76,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
             git build-essential libssl-dev libelf-dev bc flex bison ccache \
-            kmod dwarves zstd xz-utils rsync cpio python3
+            kmod dwarves zstd xz-utils rsync cpio python3 perl
           gcc --version | head -1
 
       - name: 拉取内核源码（浅克隆）
@@ -90,28 +90,29 @@ jobs:
       - name: 移除内核自带 KernelSU
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          echo "=== 查找自带 KSU 痕迹 ==="
-          grep -rn "kernelsu\|KernelSU\|CONFIG_KSU" --include=Kconfig --include=Makefile \
-            drivers/ fs/ 2>/dev/null | head -20 || echo "(Kconfig/Makefile 未发现)"
-          ls -d drivers/kernelsu fs/kernelsu 2>/dev/null || echo "(无 kernelsu 目录)"
+          echo "=== 自带 KSU 痕迹（只观察，不改动）==="
+          ls -d drivers/kernelsu fs/kernelsu KernelSU 2>/dev/null || echo "(无 KSU 目录)"
+          grep -n "kernelsu" drivers/Kconfig drivers/Makefile 2>/dev/null | head || echo "(drivers 顶层无引用)"
 
-          echo "=== 禁用配置项 ==="
-          ./scripts/config --file arch/x86/configs/${{ inputs.defconfig }} --disable CONFIG_KSU || true
-          ./scripts/config --file arch/x86/configs/${{ inputs.defconfig }} --disable CONFIG_KSU_DEBUG || true
+          # 只删除指向 kernelsu 目录/文件的引用行。
+          # 不要用 `sed '/kernelsu/I d'` 这类模糊删除：会误删 depends on / 注释等行，
+          # 破坏 Kconfig 语法，导致下一步 make defconfig 直接解析失败。
+          sed -i '/kernelsu\/Kconfig/d' drivers/Kconfig 2>/dev/null || true
+          sed -i '/kernelsu\//d' drivers/Makefile 2>/dev/null || true
 
-          echo "=== 删除 KSU 源码目录（若存在）==="
           rm -rf drivers/kernelsu fs/kernelsu || true
 
-          echo "=== 清理 Kconfig / Makefile 中的引用 ==="
-          grep -rl "kernelsu" drivers/*/Kconfig drivers/*/Makefile fs/*/Kconfig 2>/dev/null | while read -r f; do
-            echo "  清理: $f"
-            sed -i '/kernelsu/I d' "$f"
-          done
+          echo "=== 清理后校验 ==="
+          grep -n "kernelsu" drivers/Kconfig drivers/Makefile 2>/dev/null || echo "  (已无残留引用)"
 
       - name: 生成基础配置并瘦身
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          make ${{ inputs.defconfig }}
+          chmod +x scripts/config 2>/dev/null || true
+          make ARCH=x86_64 ${{ inputs.defconfig }}
+          # 目录已删，必须同时关掉开关，否则 make 会去编译不存在的 kernelsu/Makefile
+          ./scripts/config --disable CONFIG_KSU || true
+          ./scripts/config --disable CONFIG_KSU_DEBUG || true
           # 关键瘦身：关掉调试信息能省下数 GB，对 14GB 磁盘的托管 runner 是刚需
           ./scripts/config --disable CONFIG_DEBUG_INFO
           ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
@@ -119,7 +120,9 @@ jobs:
           # KPM 硬需求（SukiSU Ultra 官方要求非 GKI 设备必须开）
           ./scripts/config --enable CONFIG_KALLSYMS
           ./scripts/config --enable CONFIG_KALLSYMS_ALL
-          make olddefconfig
+          make ARCH=x86_64 olddefconfig
+          echo "=== 配置生成结果 ==="
+          grep -E "CONFIG_KSU=|CONFIG_KALLSYMS=|CONFIG_KALLSYMS_ALL=|CONFIG_DEBUG_INFO=" .config || true
 
       - name: 拉取 SukiSU Ultra 并集成
         run: |
@@ -141,7 +144,7 @@ jobs:
         run: |
           ./scripts/config --enable CONFIG_KSU
           ./scripts/config --enable CONFIG_KPM
-          make olddefconfig
+          make ARCH=x86_64 olddefconfig
           echo "=== 校验关键配置 ==="
           grep -E "CONFIG_KSU=|CONFIG_KPM=|CONFIG_KALLSYMS=|CONFIG_KALLSYMS_ALL=" .config || true
 
@@ -165,7 +168,7 @@ jobs:
       - name: 编译内核
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          make -j$(nproc) 2>&1 | tail -40
+          make ARCH=x86_64 -j$(nproc) 2>&1 | tail -60
         timeout-minutes: 300
 
       - name: 收集产物
@@ -174,7 +177,7 @@ jobs:
           test -f arch/x86/boot/bzImage || { echo "::error::未生成 bzImage"; exit 1; }
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp arch/x86/boot/bzImage "$GITHUB_WORKSPACE/out/kernel-$(make kernelversion)"
-          make modules_install INSTALL_MOD_PATH="$GITHUB_WORKSPACE/out/modules"
+          make ARCH=x86_64 modules_install INSTALL_MOD_PATH="$GITHUB_WORKSPACE/out/modules"
           cd "$GITHUB_WORKSPACE/out"
           cp "$KERNEL_DIR/.config" ./config-used.txt
           tar czf modules.tar.gz -C modules .
