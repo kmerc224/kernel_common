@@ -138,6 +138,43 @@ jobs:
             exit 1
           }
 
+      - name: 校验并修复失效的 Kbuild 引用
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          python3 - <<'PY'
+          import re, os
+          fixed = 0
+          for f in ['drivers/Kconfig', 'drivers/Makefile', 'fs/Kconfig', 'fs/Makefile']:
+              if not os.path.exists(f):
+                  continue
+              src = open(f, encoding='utf-8', errors='replace').read().splitlines()
+              out = []
+              for l in src:
+                  m = re.search(r'^\s*source\s+"([^"]+)"', l)
+                  if m and not os.path.exists(m.group(1)):
+                      print('  移除失效 source: %s -> %s' % (f, m.group(1))); fixed += 1; continue
+                  m2 = re.match(r'^\s*obj-\$\([^)]*\)\s*\+=\s*(\S+)', l)
+                  if m2 and not os.path.exists(m2.group(1).rstrip('/')):
+                      print('  移除失效 obj: %s -> %s' % (f, m2.group(1))); fixed += 1; continue
+                  out.append(l)
+              open(f, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
+          print('共修复 %d 处失效引用' % fixed)
+          PY
+
+          echo "=== SukiSU 源码实际落点 ==="
+          ls -d drivers/kernelsu KernelSU drivers/*su* 2>/dev/null || echo "(drivers 下未发现)"
+
+          # 若源码确实存在但 source 行缺失，补回去（setup.sh 有时会漏写）
+          for d in drivers/kernelsu KernelSU; do
+            if [ -f "$d/Kconfig" ] && ! grep -q "$d/Kconfig" drivers/Kconfig; then
+              echo "source \"$d/Kconfig\"" >> drivers/Kconfig
+              echo "  已补回 source: $d/Kconfig"
+            fi
+          done
+          echo "=== CONFIG_KSU 是否有 Kconfig 定义 ==="
+          grep -rn "^config KSU\b" --include=Kconfig . 2>/dev/null | head -5 \
+            || echo "::warning::未找到 KSU 的 Kconfig 定义，后续 enable CONFIG_KSU 将无效"
+
       - name: 开启 KPM 与 SukiSU 相关配置
         if: ${{ inputs.enable_kpm }}
         working-directory: ${{ env.KERNEL_DIR }}
