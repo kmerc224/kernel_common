@@ -287,7 +287,7 @@ jobs:
           # 一次性 make 会出现 vmlinux 尚未链接、modpost 就已开始处理模块的情况：
           # 符号表为空，任意模块引用 debugfs/sysfs_emit/eventfd 等基础符号都报
           # undefined!（实测先 kvm.ko，关掉后换 842/mhi 报，同一根因）。
-          echo "=== 阶段 1/2：链接 vmlinux（生成符号表）==="
+          echo "=== 阶段 1/3：链接 vmlinux（生成符号表）==="
           make ARCH=x86_64 -j$(nproc) vmlinux 2>&1 \
             | tee "$GITHUB_WORKSPACE/build-vmlinux.log"
           # 必须用 PIPESTATUS[0]，不能写 $?：
@@ -296,21 +296,31 @@ jobs:
           RC1=${PIPESTATUS[0]}
           echo "vmlinux 退出码: $RC1"
 
-          echo "=== 阶段 2/2：构建模块（依赖上一步的符号表）==="
+          echo "=== 阶段 2/3：构建模块（依赖上一步的符号表）==="
           make ARCH=x86_64 -j$(nproc) modules 2>&1 \
             | tee "$GITHUB_WORKSPACE/build-modules.log"
           RC2=${PIPESTATUS[0]}
           echo "modules 退出码: $RC2"
 
+          # 阶段 3 不能省：make vmlinux 只产出 ELF 格式的 vmlinux，
+          # ISO 真正需要的是压缩后的可引导镜像 arch/x86/boot/bzImage。
+          # 少了这步，编译全程成功却在收集产物时报"未生成 bzImage"。
+          echo "=== 阶段 3/3：生成可引导镜像 bzImage ==="
+          make ARCH=x86_64 -j$(nproc) bzImage 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-bzimage.log"
+          RC3=${PIPESTATUS[0]}
+          echo "bzImage 退出码: $RC3"
+
           # 无论成败都先合成日志，保证 artifact 一定有内容可查
           cat "$GITHUB_WORKSPACE"/build-vmlinux.log "$GITHUB_WORKSPACE"/build-modules.log \
+              "$GITHUB_WORKSPACE"/build-bzimage.log \
             > "$GITHUB_WORKSPACE/build.log" 2>/dev/null || true
 
           echo "=== 产物存在性 ==="
           ls -lh vmlinux arch/x86/boot/bzImage 2>&1 || true
 
-          if [ "$RC1" -ne 0 ] || [ "$RC2" -ne 0 ]; then
-            echo "::error::编译失败 vmlinux=$RC1 modules=$RC2"
+          if [ "$RC1" -ne 0 ] || [ "$RC2" -ne 0 ] || [ "$RC3" -ne 0 ]; then
+            echo "::error::编译失败 vmlinux=$RC1 modules=$RC2 bzImage=$RC3"
             exit 1
           fi
           echo "编译完成：$(date -u)"
