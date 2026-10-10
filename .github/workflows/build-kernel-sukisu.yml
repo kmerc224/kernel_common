@@ -252,30 +252,45 @@ jobs:
       - name: 编译内核
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          # set -o pipefail 至关重要：让管道中任一命令失败即视为失败。
-          # 若写成 `make ... | tail -60`，退出码会变成 tail 的 0，
-          # 编译失败却显示"成功"，直到下一步才发现没有 bzImage。
-          set -o pipefail
           echo "开始编译：$(date -u)  并发 $(nproc) 核"
+          echo "=== 编译前置检查 ==="
+          ls -l .config 2>&1 | head -2
+          make --version | head -1
+          gcc --version   | head -1
+
+          # 手动接管错误码，不用 pipefail + bash -e：
+          # 那样 make 一失败脚本立刻退出，后面合并日志的 cat 根本执行不到，
+          # 等于把现场销毁（上一次的日志就是这么丢的）。
+          set +e
 
           # 必须分两步，不能只跑 make。
-          # 一次性 make 时会出现 vmlinux 尚未链接、modpost 就已开始处理模块的情况：
-          # 符号表为空 → 任意模块引用 debugfs/sysfs_emit/eventfd 等基础符号都报
-          #   "undefined!"（实测先 kvm.ko，关掉后换 842/mhi 报，属同一根因）。
-          # 先显式构建 vmlinux 生成符号表，再编模块，依赖关系才正确。
+          # 一次性 make 会出现 vmlinux 尚未链接、modpost 就已开始处理模块的情况：
+          # 符号表为空，任意模块引用 debugfs/sysfs_emit/eventfd 等基础符号都报
+          # undefined!（实测先 kvm.ko，关掉后换 842/mhi 报，同一根因）。
           echo "=== 阶段 1/2：链接 vmlinux（生成符号表）==="
           make ARCH=x86_64 -j$(nproc) vmlinux 2>&1 \
             | tee "$GITHUB_WORKSPACE/build-vmlinux.log"
+          RC1=$?
+          echo "vmlinux 退出码: $RC1"
 
           echo "=== 阶段 2/2：构建模块（依赖上一步的符号表）==="
           make ARCH=x86_64 -j$(nproc) modules 2>&1 \
             | tee "$GITHUB_WORKSPACE/build-modules.log"
+          RC2=$?
+          echo "modules 退出码: $RC2"
 
+          # 无论成败都先合成日志，保证 artifact 一定有内容可查
           cat "$GITHUB_WORKSPACE"/build-vmlinux.log "$GITHUB_WORKSPACE"/build-modules.log \
-            > "$GITHUB_WORKSPACE/build.log"
-          echo "编译结束：$(date -u)"
-          echo "=== vmlinux 与 bzImage 存在性 ==="
+            > "$GITHUB_WORKSPACE/build.log" 2>/dev/null || true
+
+          echo "=== 产物存在性 ==="
           ls -lh vmlinux arch/x86/boot/bzImage 2>&1 || true
+
+          if [ "$RC1" -ne 0 ] || [ "$RC2" -ne 0 ]; then
+            echo "::error::编译失败 vmlinux=$RC1 modules=$RC2"
+            exit 1
+          fi
+          echo "编译完成：$(date -u)"
         timeout-minutes: 300
 
       - name: 编译失败诊断
