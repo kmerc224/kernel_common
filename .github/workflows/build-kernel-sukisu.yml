@@ -26,6 +26,10 @@ on:
         description: 'SukiSU-Ultra 分支或 tag'
         required: true
         default: 'main'
+      extra_cmdline:
+        description: '写入内核的内置启动参数（Bliss OS 需 nomodeset 才能开机）。留空则不写'
+        required: false
+        default: 'nomodeset'
       enable_kpm:
         description: '开启 KPM（Kernel Patch Module）'
         type: boolean
@@ -120,9 +124,32 @@ jobs:
           # KPM 硬需求（SukiSU Ultra 官方要求非 GKI 设备必须开）
           ./scripts/config --enable CONFIG_KALLSYMS
           ./scripts/config --enable CONFIG_KALLSYMS_ALL
+
+          # 关闭 KVM：Bliss OS 是虚拟机里的 guest，用不到 KVM 宿主能力。
+          # 实测若不关，modpost 会报 10 个 ERROR 并中断整个编译：
+          #   "eventfd_ctx_put" [arch/x86/kvm/kvm.ko] undefined!
+          #   "cpufreq_cpu_put" / "debugfs_*" ... 同理
+          # 原因是 KVM 编为模块(=m)，但其依赖符号的提供者未编入 vmlinux。
+          # 若确实需要 KVM：改为 --enable 并同时打开
+          #   CONFIG_EVENTFD / CONFIG_CPU_FREQ / CONFIG_DEBUG_FS
+          ./scripts/config --disable CONFIG_KVM || true
+          ./scripts/config --disable CONFIG_KVM_INTEL || true
+          ./scripts/config --disable CONFIG_KVM_AMD || true
+
+          # 把 nomodeset 等参数固化进内核，省得每次开机手动按 e 追加。
+          # 必须用 EXTEND（追加）而不是 OVERRIDE（覆盖）：OVERRIDE 会丢掉引导器传入的
+          # androidboot.* / SRC= 等 Android-x86 关键参数，系统会直接起不来。
+          if [ -n "${{ inputs.extra_cmdline }}" ]; then
+            ./scripts/config --enable CONFIG_CMDLINE_BOOL
+            ./scripts/config --set-str CONFIG_CMDLINE "${{ inputs.extra_cmdline }}"
+            ./scripts/config --enable CONFIG_CMDLINE_EXTEND
+            ./scripts/config --disable CONFIG_CMDLINE_OVERRIDE
+            echo "内置启动参数: ${{ inputs.extra_cmdline }}"
+          fi
+
           make ARCH=x86_64 olddefconfig
           echo "=== 配置生成结果 ==="
-          grep -E "CONFIG_KSU=|CONFIG_KALLSYMS=|CONFIG_KALLSYMS_ALL=|CONFIG_DEBUG_INFO=" .config || true
+          grep -E "CONFIG_KSU=|CONFIG_KALLSYMS=|CONFIG_KALLSYMS_ALL=|CONFIG_DEBUG_INFO=|CONFIG_CMDLINE" .config || true
 
       - name: 拉取 SukiSU Ultra 并集成
         run: |
@@ -205,8 +232,37 @@ jobs:
       - name: 编译内核
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          make ARCH=x86_64 -j$(nproc) 2>&1 | tail -60
+          # set -o pipefail 至关重要：让管道中任一命令失败即视为失败。
+          # 若写成 `make ... | tail -60`，退出码会变成 tail 的 0，
+          # 编译失败却显示"成功"，直到下一步才发现没有 bzImage。
+          set -o pipefail
+          echo "开始编译：$(date -u)  并发 $(nproc) 核"
+          make ARCH=x86_64 -j$(nproc) --output-sync=target 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build.log"
+          echo "编译结束：$(date -u)"
         timeout-minutes: 300
+
+      - name: 编译失败诊断
+        if: failure()
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          LOG="$GITHUB_WORKSPACE/build.log"
+          [ -f "$LOG" ] || { echo "::warning::未生成 build.log"; exit 0; }
+          echo "=== 典型错误行 ==="
+          grep -nE "error:|Error [0-9]+|undefined reference|No such file|fatal error|Killed" "$LOG" \
+            | head -60 || echo "(未匹配到典型错误关键词，请看下方日志尾部)"
+          echo
+          echo "=== 日志末尾 80 行 ==="
+          tail -80 "$LOG"
+
+      - name: 上传编译日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ github.workspace }}/build.log
+          retention-days: 14
+          if-no-files-found: warn
 
       - name: 收集产物
         working-directory: ${{ env.KERNEL_DIR }}
