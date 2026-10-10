@@ -169,23 +169,43 @@ jobs:
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           python3 - <<'PY'
-          import re, os
-          fixed = 0
-          for f in ['drivers/Kconfig', 'drivers/Makefile', 'fs/Kconfig', 'fs/Makefile']:
+          import re, os, sys
+          # 路径基准至关重要：
+          #   Kconfig 的 source "..."     -> 相对内核根目录
+          #   Makefile 的 obj-y += dir/   -> 相对该 Makefile 所在目录
+          # 曾经用 os.path.exists(dir) 在根目录统一判断，把 drivers/Makefile 里的
+          # phy/ gpio/ usb/ 等、fs/Makefile 里的一并误判为失效并删除，
+          # 导致大量代码没编进 vmlinux，modpost 报一片 undefined 符号。
+          FILES = ['drivers/Kconfig', 'drivers/Makefile', 'fs/Kconfig', 'fs/Makefile']
+          changes = {}
+          for f in FILES:
               if not os.path.exists(f):
                   continue
+              base = os.path.dirname(f) or '.'
               src = open(f, encoding='utf-8', errors='replace').read().splitlines()
-              out = []
+              out, removed = [], []
               for l in src:
                   m = re.search(r'^\s*source\s+"([^"]+)"', l)
                   if m and not os.path.exists(m.group(1)):
-                      print('  移除失效 source: %s -> %s' % (f, m.group(1))); fixed += 1; continue
+                      removed.append('source %s' % m.group(1)); continue
                   m2 = re.match(r'^\s*obj-\$\([^)]*\)\s*\+=\s*(\S+)', l)
-                  if m2 and not os.path.exists(m2.group(1).rstrip('/')):
-                      print('  移除失效 obj: %s -> %s' % (f, m2.group(1))); fixed += 1; continue
+                  if m2 and not os.path.exists(os.path.join(base, m2.group(1).rstrip('/'))):
+                      removed.append('obj %s' % m2.group(1)); continue
                   out.append(l)
-              open(f, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
-          print('共修复 %d 处失效引用' % fixed)
+              changes[f] = (out, removed)
+
+          # 安全阀：正常情况下只应清理 1~2 条失效引用。
+          # 一旦规模异常，说明路径判断又出错了，宁可中止也不要写入。
+          total = sum(len(r) for _, r in changes.values())
+          if total > 10:
+              print('::error::判定为误删：共 %d 条远超预期，放弃本次修改' % total)
+              sys.exit(1)
+          for f, (out, removed) in changes.items():
+              if removed:
+                  open(f, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
+                  for r in removed:
+                      print('  移除失效引用: %s -> %s' % (f, r))
+          print('共修复 %d 处' % total)
           PY
 
           echo "=== SukiSU 源码实际落点 ==="
@@ -237,9 +257,25 @@ jobs:
           # 编译失败却显示"成功"，直到下一步才发现没有 bzImage。
           set -o pipefail
           echo "开始编译：$(date -u)  并发 $(nproc) 核"
-          make ARCH=x86_64 -j$(nproc) --output-sync=target 2>&1 \
-            | tee "$GITHUB_WORKSPACE/build.log"
+
+          # 必须分两步，不能只跑 make。
+          # 一次性 make 时会出现 vmlinux 尚未链接、modpost 就已开始处理模块的情况：
+          # 符号表为空 → 任意模块引用 debugfs/sysfs_emit/eventfd 等基础符号都报
+          #   "undefined!"（实测先 kvm.ko，关掉后换 842/mhi 报，属同一根因）。
+          # 先显式构建 vmlinux 生成符号表，再编模块，依赖关系才正确。
+          echo "=== 阶段 1/2：链接 vmlinux（生成符号表）==="
+          make ARCH=x86_64 -j$(nproc) vmlinux 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-vmlinux.log"
+
+          echo "=== 阶段 2/2：构建模块（依赖上一步的符号表）==="
+          make ARCH=x86_64 -j$(nproc) modules 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-modules.log"
+
+          cat "$GITHUB_WORKSPACE"/build-vmlinux.log "$GITHUB_WORKSPACE"/build-modules.log \
+            > "$GITHUB_WORKSPACE/build.log"
           echo "编译结束：$(date -u)"
+          echo "=== vmlinux 与 bzImage 存在性 ==="
+          ls -lh vmlinux arch/x86/boot/bzImage 2>&1 || true
         timeout-minutes: 300
 
       - name: 编译失败诊断
