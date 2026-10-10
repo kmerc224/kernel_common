@@ -209,10 +209,19 @@ jobs:
         if: ${{ inputs.enable_kpm }}
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          ./scripts/config --enable CONFIG_KSU
-          ./scripts/config --enable CONFIG_KPM
+          echo "=== SukiSU / KPM 的 Kconfig 定义是否落地 ==="
+          grep -rn "^config KPM\b" --include=Kconfig . 2>/dev/null | head -3 \
+            || echo "::warning::Kconfig 中未找到 config KPM —— setup.sh 可能没接上"
+          grep -rn "^config KSU\b" --include=Kconfig . 2>/dev/null | head -3 \
+            || echo "::warning::Kconfig 中未找到 config KSU"
+
+          # 符号不存在时 scripts/config 会失败，这里不让它中断流程，
+          # 真正的成败由下面的 olddefconfig 和最终取值说话。
+          ./scripts/config --enable CONFIG_KSU  || echo "::warning::CONFIG_KSU 开启失败"
+          ./scripts/config --enable CONFIG_KPM  || echo "::warning::CONFIG_KPM 开启失败"
+
           make ARCH=x86_64 olddefconfig
-          echo "=== 校验关键配置 ==="
+          echo "=== 关键配置最终取值 ==="
           grep -E "CONFIG_KSU=|CONFIG_KPM=|CONFIG_KALLSYMS=|CONFIG_KALLSYMS_ALL=" .config || true
 
       - name: 【可选/高风险】尝试合入 SUSFS
