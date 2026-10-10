@@ -220,7 +220,15 @@ jobs:
           ./scripts/config --enable CONFIG_KSU  || echo "::warning::CONFIG_KSU 开启失败"
           ./scripts/config --enable CONFIG_KPM  || echo "::warning::CONFIG_KPM 开启失败"
 
-          make ARCH=x86_64 olddefconfig
+          # 回退保护：若开启 KSU/KPM 后 olddefconfig 失败（SukiSU 的 Kconfig 在
+          # x86 上可能引入无法满足的依赖），退回启用前的配置继续编译，
+          # 保证至少能产出内核，而不是整个流程停摆。KPM 缺失会明确告警。
+          cp .config .config.before-kpm
+          if ! make ARCH=x86_64 olddefconfig; then
+            echo "::warning::开启 KSU/KPM 后 olddefconfig 失败，回退到之前配置"
+            cp .config.before-kpm .config
+            echo "::warning::本次产出的内核将不含 KPM"
+          fi
           echo "=== 关键配置最终取值 ==="
           grep -E "CONFIG_KSU=|CONFIG_KPM=|CONFIG_KALLSYMS=|CONFIG_KALLSYMS_ALL=" .config || true
 
