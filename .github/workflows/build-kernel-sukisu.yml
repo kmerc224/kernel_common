@@ -228,6 +228,18 @@ jobs:
           ./scripts/config --enable CONFIG_KSU  || echo "::warning::CONFIG_KSU 开启失败"
           ./scripts/config --enable CONFIG_KPM  || echo "::warning::CONFIG_KPM 开启失败"
 
+          # x86_64 上这一项必开，否则必挂：
+          #   drivers/kernelsu/core/init.c:35: #error
+          #   "FATAL: Your kernel is missing the indirect syscall bypass patches!"
+          # 源码判定是：
+          #   #if defined(__x86_64__) && !defined(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER)
+          #       #ifndef X86_FEATURE_INDIRECT_SAFE -> #error
+          # X86_FEATURE_INDIRECT_SAFE 来自 GKI 的 indirect syscall bypass 补丁，
+          # Bliss 这类非 GKI 的 x86 内核没有。开启本项后 SukiSU 改用
+          # patch syscall dispatcher 的钩子方式，绕开该依赖。
+          ./scripts/config --enable CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER \
+            || echo "::warning::CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER 开启失败"
+
           # 回退保护：若开启 KSU/KPM 后 olddefconfig 失败（SukiSU 的 Kconfig 在
           # x86 上可能引入无法满足的依赖），退回启用前的配置继续编译，
           # 保证至少能产出内核，而不是整个流程停摆。KPM 缺失会明确告警。
