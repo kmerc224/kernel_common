@@ -104,7 +104,15 @@ jobs:
           sed -i '/kernelsu\/Kconfig/d' drivers/Kconfig 2>/dev/null || true
           sed -i '/kernelsu\//d' drivers/Makefile 2>/dev/null || true
 
-          rm -rf drivers/kernelsu fs/kernelsu || true
+          # 顶层 KernelSU/ 必须一并删除 —— 这是最关键的坑。
+          # SukiSU 的 setup.sh 逻辑是：
+          #   test -d "$GKI_ROOT/KernelSU" || git clone SukiSU-Ultra KernelSU
+          #   ln -sf ".../KernelSU/kernel" drivers/kernelsu
+          # 即 drivers/kernelsu 只是指向 KernelSU/kernel 的符号链接。
+          # 若旧的 KernelSU/ 残留，clone 会被跳过，setup.sh 拿旧目录当 SukiSU 仓库，
+          # 里面没有 kernel/ 子目录 → 符号链接指向空 →
+          # 编译时报 "can't open file drivers/kernelsu/Kconfig"。
+          rm -rf drivers/kernelsu fs/kernelsu KernelSU || true
 
           echo "=== 清理后校验 ==="
           grep -n "kernelsu" drivers/Kconfig drivers/Makefile 2>/dev/null || echo "  (已无残留引用)"
@@ -300,8 +308,18 @@ jobs:
         if: failure()
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
+          echo "=== 编译产物与配置状态 ==="
+          ls -l .config 2>&1 | head -2
+          ls -l include/config/auto.conf include/generated/autoconf.h 2>&1 | head -3
+          ls -l vmlinux arch/x86/boot/bzImage 2>&1 | head -3
+          echo
+
           LOG="$GITHUB_WORKSPACE/build.log"
           [ -f "$LOG" ] || { echo "::warning::未生成 build.log"; exit 0; }
+          echo "build.log 字节数: $(stat -c%s "$LOG" 2>/dev/null)"
+          echo "=== build.log 全文（内容通常很短，直接打出）==="
+          cat "$LOG"
+          echo
           echo "=== 典型错误行 ==="
           grep -nE "error:|Error [0-9]+|undefined reference|No such file|fatal error|Killed" "$LOG" \
             | head -60 || echo "(未匹配到典型错误关键词，请看下方日志尾部)"
