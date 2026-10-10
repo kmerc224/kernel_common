@@ -270,13 +270,16 @@ jobs:
           echo "=== 阶段 1/2：链接 vmlinux（生成符号表）==="
           make ARCH=x86_64 -j$(nproc) vmlinux 2>&1 \
             | tee "$GITHUB_WORKSPACE/build-vmlinux.log"
-          RC1=$?
+          # 必须用 PIPESTATUS[0]，不能写 $?：
+          # 管道中 $? 取的是最后一个命令（tee）的退出码，永远 0，
+          # 会把 make 的失败吞掉（此前两次都栽在这上面，只是形式不同）。
+          RC1=${PIPESTATUS[0]}
           echo "vmlinux 退出码: $RC1"
 
           echo "=== 阶段 2/2：构建模块（依赖上一步的符号表）==="
           make ARCH=x86_64 -j$(nproc) modules 2>&1 \
             | tee "$GITHUB_WORKSPACE/build-modules.log"
-          RC2=$?
+          RC2=${PIPESTATUS[0]}
           echo "modules 退出码: $RC2"
 
           # 无论成败都先合成日志，保证 artifact 一定有内容可查
