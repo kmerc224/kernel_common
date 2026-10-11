@@ -30,6 +30,10 @@ on:
         description: '写入内核的内置启动参数（Bliss OS 需 nomodeset 才能开机）。留空则不写'
         required: false
         default: 'nomodeset'
+      disable_kvm:
+        description: '关闭 KVM（Bliss 作 guest 用不到宿主能力，可省编译时间。仅改配置不删源码，不影响 VMware 网卡/鼠标）'
+        type: boolean
+        default: true
       enable_kpm:
         description: '开启 KPM（Kernel Patch Module）'
         type: boolean
@@ -133,16 +137,34 @@ jobs:
           ./scripts/config --enable CONFIG_KALLSYMS
           ./scripts/config --enable CONFIG_KALLSYMS_ALL
 
-          # 关闭 KVM：Bliss OS 是虚拟机里的 guest，用不到 KVM 宿主能力。
-          # 实测若不关，modpost 会报 10 个 ERROR 并中断整个编译：
-          #   "eventfd_ctx_put" [arch/x86/kvm/kvm.ko] undefined!
-          #   "cpufreq_cpu_put" / "debugfs_*" ... 同理
-          # 原因是 KVM 编为模块(=m)，但其依赖符号的提供者未编入 vmlinux。
-          # 若确实需要 KVM：改为 --enable 并同时打开
-          #   CONFIG_EVENTFD / CONFIG_CPU_FREQ / CONFIG_DEBUG_FS
-          ./scripts/config --disable CONFIG_KVM || true
-          ./scripts/config --disable CONFIG_KVM_INTEL || true
-          ./scripts/config --disable CONFIG_KVM_AMD || true
+          # 关 KVM 属可选优化：Bliss 是 guest，用不到宿主能力，关掉还能省编译时间。
+          # 顺带规避一个实测问题：KVM 编为模块(=m) 时，其依赖符号(eventfd/cpufreq/debugfs)
+          # 的提供者未进 vmlinux，modpost 会报 10 个 ERROR 中断编译。
+          # 注意：这里只改配置、不删任何源码，与 VMware 的网卡/鼠标驱动毫无关系。
+          # 若要保留 KVM，把输入项 disable_kvm 设为 false（需同时开
+          # CONFIG_EVENTFD / CONFIG_CPU_FREQ / CONFIG_DEBUG_FS 才编得过）。
+          if [ "${{ inputs.disable_kvm }}" = "true" ]; then
+            ./scripts/config --disable CONFIG_KVM || true
+            ./scripts/config --disable CONFIG_KVM_INTEL || true
+            ./scripts/config --disable CONFIG_KVM_AMD || true
+            echo "  已关闭 KVM（按输入项选择）"
+          else
+            echo "  保留 KVM 开启"
+          fi
+
+          # ---- VMware guest 驱动内置化 ----
+          # 重点：这些驱动本来就在内核源码里（drivers/net/vmxnet3/、drivers/gpu/drm/vmwgfx/ 等），
+          # 不需要额外"合入"任何代码。问题在于 defconfig 把它们全设成了 =m（模块），
+          # 一旦运行时没加载，表现就是网卡不通 / 鼠标不动。
+          # 改成 =y 编进内核本体，就不再依赖 /lib/modules 的加载环节。
+          ./scripts/config --enable CONFIG_HYPERVISOR_GUEST || true
+          ./scripts/config --enable CONFIG_VMXNET3 || true          # VMware 网卡
+          ./scripts/config --enable CONFIG_VMWARE_VMCI || true
+          ./scripts/config --enable CONFIG_VMWARE_BALLOON || true
+          ./scripts/config --enable CONFIG_DRM_VMWGFX || true       # VMware 显卡（影响分辨率）
+          ./scripts/config --enable CONFIG_E1000 || true            # Intel 网卡（VMware 常用备选）
+          ./scripts/config --enable CONFIG_E1000E || true
+          echo "  VMware guest 驱动已设为内置"
 
           # 输入设备驱动内置化。
           # defconfig 里 CONFIG_MOUSE_PS2 是 =m（模块）、CONFIG_USB_HID/HID_GENERIC 是 =y（内置）。
