@@ -144,6 +144,19 @@ jobs:
           ./scripts/config --disable CONFIG_KVM_INTEL || true
           ./scripts/config --disable CONFIG_KVM_AMD || true
 
+          # 输入设备驱动内置化。
+          # defconfig 里 CONFIG_MOUSE_PS2 是 =m（模块）、CONFIG_USB_HID/HID_GENERIC 是 =y（内置）。
+          # 虚拟机(VMware)的虚拟鼠标常走 PS/2 路径，一旦 psmouse 模块没被加载，
+          # 表现就是"换了内核后鼠标不见了"。把它改成 =y 彻底摆脱模块加载依赖。
+          # 顺带把键盘、触摸板、多点触控一并内置，防止同类问题复发。
+          ./scripts/config --enable CONFIG_MOUSE_PS2 || true
+          ./scripts/config --enable CONFIG_KEYBOARD_ATKBD || true
+          ./scripts/config --enable CONFIG_INPUT_EVDEV || true
+          ./scripts/config --enable CONFIG_HID_GENERIC || true
+          ./scripts/config --enable CONFIG_USB_HID || true
+          ./scripts/config --enable CONFIG_HID_MULTITOUCH || true
+          echo "  输入设备驱动已设为内置"
+
           # 把 nomodeset 等参数固化进内核，省得每次开机手动按 e 追加。
           # 必须用 EXTEND（追加）而不是 OVERRIDE（覆盖）：OVERRIDE 会丢掉引导器传入的
           # androidboot.* / SRC= 等 Android-x86 关键参数，系统会直接起不来。
