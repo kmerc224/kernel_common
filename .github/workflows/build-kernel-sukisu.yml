@@ -1,21 +1,34 @@
 name: Build Bliss Kernel + SukiSU Ultra + KPM
 
-# 编译 Bliss OS 内核，移除内核自带 KernelSU，接入 SukiSU Ultra，开启 KPM，可选 SUSFS。
+# 编译 Bliss OS 内核：移除自带 KernelSU → 接入 SukiSU Ultra → 开 KPM →
+# 把 Intel AX200（iwlwifi）的驱动连同固件一起编进内核本体，
+# 使其不依赖 /lib/modules 与 /vendor/firmware 即可工作（裸机装机刚需）。
 #
-# ⚠️ 已知风险（写在最前面，别跳过）：
-#   1. SukiSU Ultra 官方声明 X86_64 仅 "some" 支持 —— x86_64 不是它的主战场，arm64 才是。
-#   2. Bliss 的 kernel_common 是 **非 GKI** 内核。SUSFS 补丁主要面向 GKI(android12-5.10/13-5.15/14-6.1)，
-#      对非 GKI x86 内核极可能打不上或需手工修 patch。故 SUSFS 默认关闭，开启属自选风险。
-#   3. GitHub 托管 runner 磁盘约 14GB，内核编译连产物通常 10–20GB。
-#      本 workflow 已禁用 DEBUG_INFO 大幅瘦身；若仍爆盘，请改用 self-hosted runner。
+# 产物：bzImage + 内核模块 tarball → Artifacts / Releases。
 #
-# 产物：bzImage 内核 + 内核模块 tarball，发布到 Releases / Actions Artifacts。
+# ── 踩过的坑，改配置时别踩回去 ──────────────────────────────
+#  1. 必须分三步编：vmlinux → modules → bzImage。一次性 make 会让 modpost 早于
+#     vmlinux 链接，符号表为空，任意模块引用基础符号都报 undefined!。
+#  2. 判退出码用 ${PIPESTATUS[0]}，不能用 $?（管道里 $? 取的是 tee 的码，永远 0）。
+#  3. 顶层 KernelSU/ 必须先删干净：setup.sh 是 `test -d KernelSU || git clone`，
+#     残留旧目录会让 drivers/kernelsu 链接指向空 → "can't open file .../Kconfig"。
+#  4. 删 KSU 引用要用精确 sed，不能用 /kernelsu/I d —— 会误删 depends on 等行，
+#     破坏 Kconfig 语法，下一步 make defconfig 直接解析失败。
+#  5. 别"修复" drivers/Makefile 里的失效 obj 引用：曾整片删掉 phy/ gpio/ usb/，
+#     vmlinux 缺代码，modpost 报一片 undefined。
+#  6. cmdline 必须用 EXTEND（追加）。OVERRIDE 会丢掉引导器传入的 androidboot.* /
+#     SRC= 等 Android-x86 关键参数，系统直接起不来。
+#  7. ubuntu-latest 将于 2026-10-19 迁移到 Ubuntu 26；BlissOS 官方排除 24.04+
+#     （装不上 libncurses5），必须钉死 ubuntu-22.04。
+#  8. built-in 驱动在 rootfs 挂载前就 probe，此时读不到 /vendor/firmware，
+#     所以 iwlwifi 内置化必须同时把 .ucode 用 CONFIG_EXTRA_FIRMWARE 编进 vmlinux。
+# ────────────────────────────────────────────────────────
 
 on:
   workflow_dispatch:
     inputs:
       kernel_branch:
-        description: 'kernel_common 分支（16.9.7 对应 gloria-20240908 / 6.1.96）'
+        description: 'kernel_common 分支（16.9.7 → gloria-20240908 / 6.1.96）'
         required: true
         default: 'gloria-20240908'
       defconfig:
@@ -27,11 +40,11 @@ on:
         required: true
         default: 'main'
       extra_cmdline:
-        description: '写入内核的内置启动参数（Bliss OS 需 nomodeset 才能开机）。留空则不写'
+        description: '内置启动参数（追加）。⚠️ 裸机装机请清空：nomodeset 会关掉 i915 硬解'
         required: false
         default: 'nomodeset'
-      disable_kvm:
-        description: '关闭 KVM（Bliss 作 guest 用不到宿主能力，可省编译时间。仅改配置不删源码，不影响 VMware 网卡/鼠标）'
+      ax200_builtin:
+        description: 'Intel AX200 驱动+固件编进内核（裸机用；纯虚拟机可关）'
         type: boolean
         default: true
       enable_kpm:
@@ -39,13 +52,9 @@ on:
         type: boolean
         default: true
       enable_susfs:
-        description: '【高风险】尝试合入 SUSFS 补丁，非 GKI 内核大概率失败'
+        description: '【高风险】尝试合入 SUSFS，非 GKI 内核大概率失败'
         type: boolean
         default: false
-      susfs_repo:
-        description: 'SUSFS 补丁仓库'
-        required: false
-        default: 'https://github.com/sidex15/susfs4ksu'
       publish_release:
         description: '发布到 Releases'
         type: boolean
@@ -58,304 +67,216 @@ on:
 permissions:
   contents: write
 
+env:
+  KERNEL_DIR: ${{ github.workspace }}/kernel
+  SUKISU_DIR: ${{ github.workspace }}/SukiSU-Ultra
+  FW_DIR:     ${{ github.workspace }}/firmware
+
 jobs:
   build:
-    # 内核编译比整棵 AOSP 轻得多，托管 runner 值得一试；爆盘则改 self-hosted
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 350
 
-    env:
-      KERNEL_DIR: ${{ github.workspace }}/kernel
-      SUKISU_DIR: ${{ github.workspace }}/SukiSU-Ultra
-
     steps:
-      - name: 磁盘与资源自检
+      - name: 依赖与磁盘自检
         run: |
-          df -h "$GITHUB_WORKSPACE"
           AVAIL=$(df --output=avail -BG "$GITHUB_WORKSPACE" | tail -1 | tr -dc '0-9')
-          echo "可用空间 ${AVAIL}GB；CPU $(nproc) 核"
-          if [ "${AVAIL:-0}" -lt 12 ]; then
-            echo "::error::可用空间 ${AVAIL}GB 过少，内核编译大概率失败。请改用 self-hosted runner。"
-            exit 1
-          fi
-
-      - name: 安装内核编译依赖
-        run: |
+          echo "可用 ${AVAIL:-0}GB / CPU $(nproc) 核"
+          [ "${AVAIL:-0}" -lt 12 ] && { echo "::error::磁盘不足，请改 self-hosted runner"; exit 1; }
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
             git build-essential libssl-dev libelf-dev bc flex bison ccache \
             kmod dwarves zstd xz-utils rsync cpio python3 perl
           gcc --version | head -1
 
-      - name: 拉取内核源码（浅克隆）
+      - name: 拉取内核源码
         run: |
           git clone --depth 1 -b "${{ inputs.kernel_branch }}" \
             https://github.com/android-generic/kernel_common.git "$KERNEL_DIR"
-          cd "$KERNEL_DIR"
-          # 打印版本，确认拉对了分支
-          make kernelversion
+          cd "$KERNEL_DIR" && make kernelversion
 
-      - name: 移除内核自带 KernelSU
+      - name: 移除自带 KernelSU
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          echo "=== 自带 KSU 痕迹（只观察，不改动）==="
-          ls -d drivers/kernelsu fs/kernelsu KernelSU 2>/dev/null || echo "(无 KSU 目录)"
-          grep -n "kernelsu" drivers/Kconfig drivers/Makefile 2>/dev/null | head || echo "(drivers 顶层无引用)"
-
-          # 只删除指向 kernelsu 目录/文件的引用行。
-          # 不要用 `sed '/kernelsu/I d'` 这类模糊删除：会误删 depends on / 注释等行，
-          # 破坏 Kconfig 语法，导致下一步 make defconfig 直接解析失败。
-          sed -i '/kernelsu\/Kconfig/d' drivers/Kconfig 2>/dev/null || true
-          sed -i '/kernelsu\//d' drivers/Makefile 2>/dev/null || true
-
-          # 顶层 KernelSU/ 必须一并删除 —— 这是最关键的坑。
-          # SukiSU 的 setup.sh 逻辑是：
-          #   test -d "$GKI_ROOT/KernelSU" || git clone SukiSU-Ultra KernelSU
-          #   ln -sf ".../KernelSU/kernel" drivers/kernelsu
-          # 即 drivers/kernelsu 只是指向 KernelSU/kernel 的符号链接。
-          # 若旧的 KernelSU/ 残留，clone 会被跳过，setup.sh 拿旧目录当 SukiSU 仓库，
-          # 里面没有 kernel/ 子目录 → 符号链接指向空 →
-          # 编译时报 "can't open file drivers/kernelsu/Kconfig"。
-          rm -rf drivers/kernelsu fs/kernelsu KernelSU || true
-
-          echo "=== 清理后校验 ==="
-          grep -n "kernelsu" drivers/Kconfig drivers/Makefile 2>/dev/null || echo "  (已无残留引用)"
+          sed -i '/kernelsu\/Kconfig/d' drivers/Kconfig   2>/dev/null || true
+          sed -i '/kernelsu\//d'        drivers/Makefile  2>/dev/null || true
+          rm -rf drivers/kernelsu fs/kernelsu KernelSU
+          grep -n "kernelsu" drivers/Kconfig drivers/Makefile 2>/dev/null \
+            || echo "已无 KSU 残留引用"
 
       - name: 生成基础配置并瘦身
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           chmod +x scripts/config 2>/dev/null || true
           make ARCH=x86_64 ${{ inputs.defconfig }}
-          # 目录已删，必须同时关掉开关，否则 make 会去编译不存在的 kernelsu/Makefile
-          ./scripts/config --disable CONFIG_KSU || true
-          ./scripts/config --disable CONFIG_KSU_DEBUG || true
-          # 关键瘦身：关掉调试信息能省下数 GB，对 14GB 磁盘的托管 runner 是刚需
-          ./scripts/config --disable CONFIG_DEBUG_INFO
-          ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
-          ./scripts/config --disable CONFIG_DEBUG_INFO_SPLIT
-          # KPM 硬需求（SukiSU Ultra 官方要求非 GKI 设备必须开）
-          ./scripts/config --enable CONFIG_KALLSYMS
-          ./scripts/config --enable CONFIG_KALLSYMS_ALL
 
-          # 关 KVM 属可选优化：Bliss 是 guest，用不到宿主能力，关掉还能省编译时间。
-          # 顺带规避一个实测问题：KVM 编为模块(=m) 时，其依赖符号(eventfd/cpufreq/debugfs)
-          # 的提供者未进 vmlinux，modpost 会报 10 个 ERROR 中断编译。
-          # 注意：这里只改配置、不删任何源码，与 VMware 的网卡/鼠标驱动毫无关系。
-          # 若要保留 KVM，把输入项 disable_kvm 设为 false（需同时开
-          # CONFIG_EVENTFD / CONFIG_CPU_FREQ / CONFIG_DEBUG_FS 才编得过）。
-          if [ "${{ inputs.disable_kvm }}" = "true" ]; then
-            ./scripts/config --disable CONFIG_KVM || true
-            ./scripts/config --disable CONFIG_KVM_INTEL || true
-            ./scripts/config --disable CONFIG_KVM_AMD || true
-            echo "  已关闭 KVM（按输入项选择）"
-          else
-            echo "  保留 KVM 开启"
-          fi
+          # 目录已删，开关也要关，否则会去编不存在的 kernelsu/Makefile
+          for s in CONFIG_KSU CONFIG_KSU_DEBUG; do
+            ./scripts/config --disable "$s" || true
+          done
+          # 关调试信息省数 GB，14GB 磁盘的托管 runner 是刚需
+          for s in CONFIG_DEBUG_INFO CONFIG_DEBUG_INFO_BTF CONFIG_DEBUG_INFO_SPLIT; do
+            ./scripts/config --disable "$s" || true
+          done
+          # SukiSU / KPM 硬需求
+          ./scripts/config --enable CONFIG_KALLSYMS     || true
+          ./scripts/config --enable CONFIG_KALLSYMS_ALL || true
 
-          # ---- VMware guest 驱动内置化 ----
-          # 重点：这些驱动本来就在内核源码里（drivers/net/vmxnet3/、drivers/gpu/drm/vmwgfx/ 等），
-          # 不需要额外"合入"任何代码。问题在于 defconfig 把它们全设成了 =m（模块），
-          # 一旦运行时没加载，表现就是网卡不通 / 鼠标不动。
-          # 改成 =y 编进内核本体，就不再依赖 /lib/modules 的加载环节。
-          ./scripts/config --enable CONFIG_HYPERVISOR_GUEST || true
-          ./scripts/config --enable CONFIG_VMXNET3 || true          # VMware 网卡
-          ./scripts/config --enable CONFIG_VMWARE_VMCI || true
-          ./scripts/config --enable CONFIG_VMWARE_BALLOON || true
-          ./scripts/config --enable CONFIG_DRM_VMWGFX || true       # VMware 显卡（影响分辨率）
-          ./scripts/config --enable CONFIG_E1000 || true            # Intel 网卡（VMware 常用备选）
-          ./scripts/config --enable CONFIG_E1000E || true
-          echo "  VMware guest 驱动已设为内置"
+          # 关 KVM：Bliss 是 guest 用不到；且 =m 时其依赖符号未进 vmlinux，
+          # modpost 会报 10 个 ERROR 中断编译（实测先 kvm.ko，关掉后换 842/mhi）。
+          for s in CONFIG_KVM CONFIG_KVM_INTEL CONFIG_KVM_AMD; do
+            ./scripts/config --disable "$s" || true
+          done
 
-          # 输入设备驱动内置化。
-          # defconfig 里 CONFIG_MOUSE_PS2 是 =m（模块）、CONFIG_USB_HID/HID_GENERIC 是 =y（内置）。
-          # 虚拟机(VMware)的虚拟鼠标常走 PS/2 路径，一旦 psmouse 模块没被加载，
-          # 表现就是"换了内核后鼠标不见了"。把它改成 =y 彻底摆脱模块加载依赖。
-          # 顺带把键盘、触摸板、多点触控一并内置，防止同类问题复发。
-          ./scripts/config --enable CONFIG_MOUSE_PS2 || true
-          ./scripts/config --enable CONFIG_KEYBOARD_ATKBD || true
-          ./scripts/config --enable CONFIG_INPUT_EVDEV || true
-          ./scripts/config --enable CONFIG_HID_GENERIC || true
-          ./scripts/config --enable CONFIG_USB_HID || true
-          ./scripts/config --enable CONFIG_HID_MULTITOUCH || true
-          echo "  输入设备驱动已设为内置"
+          # 驱动内置化：这些本来就在源码树里，defconfig 全设成了 =m，
+          # 运行时没加载就表现为网卡不通 / 鼠标不动。改 =y 摆脱模块加载依赖。
+          for s in CONFIG_HYPERVISOR_GUEST CONFIG_VMXNET3 CONFIG_VMWARE_VMCI \
+                   CONFIG_VMWARE_BALLOON CONFIG_DRM_VMWGFX \
+                   CONFIG_E1000 CONFIG_E1000E \
+                   CONFIG_MOUSE_PS2 CONFIG_KEYBOARD_ATKBD CONFIG_INPUT_EVDEV \
+                   CONFIG_HID_GENERIC CONFIG_USB_HID CONFIG_HID_MULTITOUCH; do
+            ./scripts/config --enable "$s" || echo "::warning::$s 无此符号，跳过"
+          done
 
-          # 把 nomodeset 等参数固化进内核，省得每次开机手动按 e 追加。
-          # 必须用 EXTEND（追加）而不是 OVERRIDE（覆盖）：OVERRIDE 会丢掉引导器传入的
-          # androidboot.* / SRC= 等 Android-x86 关键参数，系统会直接起不来。
+          # cmdline 只追加不覆盖（见坑 6）
           if [ -n "${{ inputs.extra_cmdline }}" ]; then
-            ./scripts/config --enable CONFIG_CMDLINE_BOOL
+            ./scripts/config --enable  CONFIG_CMDLINE_BOOL
             ./scripts/config --set-str CONFIG_CMDLINE "${{ inputs.extra_cmdline }}"
-            ./scripts/config --enable CONFIG_CMDLINE_EXTEND
+            ./scripts/config --enable  CONFIG_CMDLINE_EXTEND
             ./scripts/config --disable CONFIG_CMDLINE_OVERRIDE
             echo "内置启动参数: ${{ inputs.extra_cmdline }}"
           fi
 
           make ARCH=x86_64 olddefconfig
-          echo "=== 配置生成结果 ==="
-          grep -E "CONFIG_KSU=|CONFIG_KALLSYMS=|CONFIG_KALLSYMS_ALL=|CONFIG_DEBUG_INFO=|CONFIG_CMDLINE" .config || true
 
-      - name: 拉取 SukiSU Ultra 并集成
+      - name: Intel AX200 驱动 + 固件内置化
+        if: ${{ inputs.ax200_builtin }}
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          # ① 先开驱动。built-in 依赖链必须整条是 =y，否则 olddefconfig 会把它降级回 =m：
+          #    IWLWIFI=y 需要 MAC80211=y，MAC80211=y 需要 CFG80211=y。
+          for s in CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_IWLWIFI CONFIG_IWLMVM; do
+            ./scripts/config --enable "$s" || echo "::warning::$s 无此符号，跳过"
+          done
+          ./scripts/config --disable CONFIG_IWLDVM || true   # 老 AGN 设备，AX200 用不到
+
+          # ② 再抓固件（见坑 8）。
+          #    blob:none + sparse 只取 cc-a0 系列，避免拉整个几百 MB 的 linux-firmware。
+          rm -rf "$FW_DIR"
+          git clone --depth 1 --filter=blob:none --sparse \
+              https://github.com/wkennington/linux-firmware.git "$FW_DIR" \
+            || { rm -rf "$FW_DIR"
+                 git clone --depth 1 --filter=blob:none --sparse \
+                   https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git "$FW_DIR"
+               } || echo "::warning::linux-firmware 克隆失败，跳过固件内置"
+          if [ -d "$FW_DIR" ]; then
+            ( cd "$FW_DIR" && git sparse-checkout init --no-cone \
+                && git sparse-checkout set '/iwlwifi-cc-a0*' )
+          fi
+          echo "取到的固件："; ls -l "$FW_DIR" 2>/dev/null | grep iwlwifi || echo "  (空)"
+
+          # 只取版本号最大的 3 个 ucode + 最新的 pnvm，别把一整套历史固件塞进内核
+          FW_LIST=$(ls "$FW_DIR"/iwlwifi-cc-a0-*.ucode 2>/dev/null \
+                    | xargs -n1 basename | sort -V -r | head -3 | tr '\n' ' ')
+          PNVM=$(ls "$FW_DIR"/iwlwifi-cc-a0-*.pnvm 2>/dev/null \
+                 | xargs -n1 basename | sort -V -r | head -1)
+          FW_LIST=$(echo "$FW_LIST $PNVM" | xargs)   # 去掉首尾空格
+
+          if [ -z "$FW_LIST" ]; then
+            echo "::warning::未取到 AX200 固件，本次只内置驱动。"
+            echo "::warning::运行时仍需 /vendor/firmware/iwlwifi-cc-a0-*.ucode，否则 Wi-Fi 起不来。"
+          else
+            echo "内置固件: $FW_LIST"
+            ./scripts/config --set-str CONFIG_EXTRA_FIRMWARE_DIR "$FW_DIR"
+            ./scripts/config --set-str CONFIG_EXTRA_FIRMWARE     "$FW_LIST"
+            ./scripts/config --enable  CONFIG_FIRMWARE_IN_KERNEL
+          fi
+
+          make ARCH=x86_64 olddefconfig
+          echo "=== AX200 相关最终取值 ==="
+          grep -E '^CONFIG_(CFG80211|MAC80211|IWLWIFI|IWLMVM|IWLDVM|EXTRA_FIRMWARE|EXTRA_FIRMWARE_DIR|FIRMWARE_IN_KERNEL)=' .config \
+            || echo "  (未取到，注意是否被降级为 =m)"
+
+      - name: 集成 SukiSU Ultra
         run: |
           git clone --depth 1 -b "${{ inputs.sukisu_ref }}" \
             https://github.com/SukiSU-Ultra/SukiSU-Ultra.git "$SUKISU_DIR"
-          ls "$SUKISU_DIR/kernel"
           test -f "$SUKISU_DIR/kernel/setup.sh" || { echo "::error::未找到 setup.sh"; exit 1; }
-
           cd "$KERNEL_DIR"
-          # SukiSU Ultra 官方集成脚本（KernelSU 系通用做法）
-          bash "$SUKISU_DIR/kernel/setup.sh" "${{ inputs.sukisu_ref }}" || {
-            echo "::error::setup.sh 集成失败。非 GKI/x86 内核常见问题，需手工适配。"
-            exit 1
-          }
+          bash "$SUKISU_DIR/kernel/setup.sh" "${{ inputs.sukisu_ref }}" \
+            || { echo "::error::setup.sh 集成失败，非 GKI/x86 内核常见，需手工适配"; exit 1; }
 
-      - name: 校验并修复失效的 Kbuild 引用
+      - name: 校验并补回 Kbuild 引用
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          python3 - <<'PY'
-          import re, os
-          # 只读检查，绝不修改文件。
-          # 历史教训：这一旦动手删就是灾难 —— 曾把 drivers/Makefile 的 phy/ gpio/
-          # usb/ 等、fs/Makefile 的内容整片判为失效删掉，vmlinux 缺代码，
-          # modpost 报一片 undefined（先后栽在 kvm.ko、842/mhi 上）。
-          # 真正的 kernelsu 引用清理已由前面的步骤精确完成，这里只做体检报告。
-          FILES = ['drivers/Kconfig', 'drivers/Makefile', 'fs/Kconfig', 'fs/Makefile']
-          for f in FILES:
-              if not os.path.exists(f):
-                  continue
-              base = os.path.dirname(f) or '.'
-              for l in open(f, encoding='utf-8', errors='replace'):
-                  l = l.rstrip('\n')
-                  m = re.search(r'^\s*source\s+"([^"]+)"', l)
-                  if m and not os.path.exists(m.group(1)):
-                      print('::warning::失效 source: %s -> %s' % (f, m.group(1)))
-                  m2 = re.match(r'^\s*obj-\$\([^)]*\)\s*\+=\s*(\S+)', l)
-                  if m2 and not os.path.exists(os.path.join(base, m2.group(1).rstrip('/'))):
-                      print('::warning::失效 obj: %s -> %s' % (f, m2.group(1)))
-          print('Kbuild 引用体检完成（只读，未修改任何文件）')
-          PY
-
-          echo "=== SukiSU 源码实际落点 ==="
-          ls -d drivers/kernelsu KernelSU drivers/*su* 2>/dev/null || echo "(drivers 下未发现)"
-
-          # 若源码确实存在但 source 行缺失，补回去（setup.sh 有时会漏写）
+          # 只读体检（见坑 5：绝不自动删）
+          grep -oP '^\s*source\s+"\K[^"]+' drivers/Kconfig 2>/dev/null | while read -r f; do
+            [ -e "$f" ] || echo "::warning::失效 source: $f"
+          done
+          # setup.sh 偶尔漏写 source 行，补回去
           for d in drivers/kernelsu KernelSU; do
             if [ -f "$d/Kconfig" ] && ! grep -q "$d/Kconfig" drivers/Kconfig; then
               echo "source \"$d/Kconfig\"" >> drivers/Kconfig
               echo "  已补回 source: $d/Kconfig"
             fi
           done
-          echo "=== CONFIG_KSU 是否有 Kconfig 定义 ==="
-          grep -rn "^config KSU\b" --include=Kconfig . 2>/dev/null | head -5 \
-            || echo "::warning::未找到 KSU 的 Kconfig 定义，后续 enable CONFIG_KSU 将无效"
+          grep -rn "^config KSU\b" --include=Kconfig . 2>/dev/null | head -3 \
+            || echo "::warning::未找到 config KSU 定义，后续 enable CONFIG_KSU 将无效"
 
-      - name: 开启 KPM 与 SukiSU 相关配置
+      - name: 开启 KPM
         if: ${{ inputs.enable_kpm }}
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          echo "=== SukiSU / KPM 的 Kconfig 定义是否落地 ==="
           grep -rn "^config KPM\b" --include=Kconfig . 2>/dev/null | head -3 \
-            || echo "::warning::Kconfig 中未找到 config KPM —— setup.sh 可能没接上"
-          grep -rn "^config KSU\b" --include=Kconfig . 2>/dev/null | head -3 \
-            || echo "::warning::Kconfig 中未找到 config KSU"
+            || echo "::warning::未找到 config KPM，setup.sh 可能没接上"
+          ./scripts/config --enable CONFIG_KSU || echo "::warning::CONFIG_KSU 开启失败"
+          ./scripts/config --enable CONFIG_KPM || echo "::warning::CONFIG_KPM 开启失败"
 
-          # 符号不存在时 scripts/config 会失败，这里不让它中断流程，
-          # 真正的成败由下面的 olddefconfig 和最终取值说话。
-          ./scripts/config --enable CONFIG_KSU  || echo "::warning::CONFIG_KSU 开启失败"
-          ./scripts/config --enable CONFIG_KPM  || echo "::warning::CONFIG_KPM 开启失败"
-
-          # x86_64 上这一项必开，否则必挂：
-          #   drivers/kernelsu/core/init.c:35: #error
-          #   "FATAL: Your kernel is missing the indirect syscall bypass patches!"
-          # 源码判定是：
-          #   #if defined(__x86_64__) && !defined(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER)
-          #       #ifndef X86_FEATURE_INDIRECT_SAFE -> #error
-          # X86_FEATURE_INDIRECT_SAFE 来自 GKI 的 indirect syscall bypass 补丁，
-          # Bliss 这类非 GKI 的 x86 内核没有。开启本项后 SukiSU 改用
-          # patch syscall dispatcher 的钩子方式，绕开该依赖。
+          # x86_64 上必开，否则编译期直接 #error：
+          #   drivers/kernelsu/core/init.c: "missing the indirect syscall bypass patches!"
+          # 原因：SukiSU 默认依赖 GKI 的 X86_FEATURE_INDIRECT_SAFE，Bliss 这类
+          # 非 GKI x86 内核没有。开启后改用 patch syscall dispatcher 的钩子方式绕开。
           ./scripts/config --enable CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER \
             || echo "::warning::CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER 开启失败"
 
-          # 回退保护：若开启 KSU/KPM 后 olddefconfig 失败（SukiSU 的 Kconfig 在
-          # x86 上可能引入无法满足的依赖），退回启用前的配置继续编译，
-          # 保证至少能产出内核，而不是整个流程停摆。KPM 缺失会明确告警。
+          # 回退保护：KSU/KPM 的 Kconfig 在 x86 上可能引入无法满足的依赖。
+          # 失败就退回启用前的配置，保证至少能产出内核而不是整个流程停摆。
           cp .config .config.before-kpm
-          if ! make ARCH=x86_64 olddefconfig; then
-            echo "::warning::开启 KSU/KPM 后 olddefconfig 失败，回退到之前配置"
+          make ARCH=x86_64 olddefconfig || {
+            echo "::warning::开启 KSU/KPM 后 olddefconfig 失败，回退"
             cp .config.before-kpm .config
-            echo "::warning::本次产出的内核将不含 KPM"
-          fi
-          echo "=== 关键配置最终取值 ==="
-          grep -E "CONFIG_KSU=|CONFIG_KPM=|CONFIG_KALLSYMS=|CONFIG_KALLSYMS_ALL=" .config || true
+            echo "::warning::本次产出的内核不含 KPM"
+          }
+          grep -E "^CONFIG_(KSU|KPM|KALLSYMS|KALLSYMS_ALL)=" .config || true
 
       - name: 【可选/高风险】尝试合入 SUSFS
         if: ${{ inputs.enable_susfs }}
         continue-on-error: true
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          echo "::warning::SUSFS 补丁面向 GKI 内核，非 GKI x86 大概率打不上，失败不影响后续步骤。"
-          git clone --depth 1 "${{ inputs.susfs_repo }}" ../susfs || exit 1
-          cd ../susfs && ls kernel_patches
-          cd "$KERNEL_DIR"
-          # 视补丁布局而定，这里给出最常见的两种尝试，失败即跳过
+          echo "::warning::SUSFS 面向 GKI 内核，非 GKI x86 大概率打不上，失败不影响后续。"
+          git clone --depth 1 https://github.com/sidex15/susfs4ksu.git ../susfs || exit 1
           for p in $(find ../susfs/kernel_patches -name '50_add_susfs_in_kernel*.patch'); do
-            echo "尝试: $p"
             patch -p1 --forward --fuzz=3 < "$p" || echo "补丁 $p 失败，跳过"
           done
           ./scripts/config --enable CONFIG_KSU_SUSFS || true
-          make olddefconfig || true
+          make ARCH=x86_64 olddefconfig || true
 
       - name: 编译内核
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          echo "开始编译：$(date -u)  并发 $(nproc) 核"
-          echo "=== 编译前置检查 ==="
-          ls -l .config 2>&1 | head -2
-          make --version | head -1
-          gcc --version   | head -1
-
-          # 手动接管错误码，不用 pipefail + bash -e：
-          # 那样 make 一失败脚本立刻退出，后面合并日志的 cat 根本执行不到，
-          # 等于把现场销毁（上一次的日志就是这么丢的）。
-          set +e
-
-          # 必须分两步，不能只跑 make。
-          # 一次性 make 会出现 vmlinux 尚未链接、modpost 就已开始处理模块的情况：
-          # 符号表为空，任意模块引用 debugfs/sysfs_emit/eventfd 等基础符号都报
-          # undefined!（实测先 kvm.ko，关掉后换 842/mhi 报，同一根因）。
-          echo "=== 阶段 1/3：链接 vmlinux（生成符号表）==="
-          make ARCH=x86_64 -j$(nproc) vmlinux 2>&1 \
-            | tee "$GITHUB_WORKSPACE/build-vmlinux.log"
-          # 必须用 PIPESTATUS[0]，不能写 $?：
-          # 管道中 $? 取的是最后一个命令（tee）的退出码，永远 0，
-          # 会把 make 的失败吞掉（此前两次都栽在这上面，只是形式不同）。
-          RC1=${PIPESTATUS[0]}
-          echo "vmlinux 退出码: $RC1"
-
-          echo "=== 阶段 2/3：构建模块（依赖上一步的符号表）==="
-          make ARCH=x86_64 -j$(nproc) modules 2>&1 \
-            | tee "$GITHUB_WORKSPACE/build-modules.log"
-          RC2=${PIPESTATUS[0]}
-          echo "modules 退出码: $RC2"
-
-          # 阶段 3 不能省：make vmlinux 只产出 ELF 格式的 vmlinux，
-          # ISO 真正需要的是压缩后的可引导镜像 arch/x86/boot/bzImage。
-          # 少了这步，编译全程成功却在收集产物时报"未生成 bzImage"。
-          echo "=== 阶段 3/3：生成可引导镜像 bzImage ==="
-          make ARCH=x86_64 -j$(nproc) bzImage 2>&1 \
-            | tee "$GITHUB_WORKSPACE/build-bzimage.log"
-          RC3=${PIPESTATUS[0]}
-          echo "bzImage 退出码: $RC3"
-
-          # 无论成败都先合成日志，保证 artifact 一定有内容可查
-          cat "$GITHUB_WORKSPACE"/build-vmlinux.log "$GITHUB_WORKSPACE"/build-modules.log \
-              "$GITHUB_WORKSPACE"/build-bzimage.log \
-            > "$GITHUB_WORKSPACE/build.log" 2>/dev/null || true
-
-          echo "=== 产物存在性 ==="
+          echo "开始编译：$(date -u)  $(nproc) 核"
+          set +e   # 手动接管错误码，保证日志合并一定执行得到（见坑 2）
+          make ARCH=x86_64 -j$(nproc) vmlinux 2>&1 | tee "$GITHUB_WORKSPACE/build-vmlinux.log"; RC1=${PIPESTATUS[0]}
+          make ARCH=x86_64 -j$(nproc) modules 2>&1 | tee "$GITHUB_WORKSPACE/build-modules.log"; RC2=${PIPESTATUS[0]}
+          make ARCH=x86_64 -j$(nproc) bzImage 2>&1 | tee "$GITHUB_WORKSPACE/build-bzimage.log"; RC3=${PIPESTATUS[0]}
+          cat "$GITHUB_WORKSPACE"/build-vmlinux.log \
+              "$GITHUB_WORKSPACE"/build-modules.log \
+              "$GITHUB_WORKSPACE"/build-bzimage.log > "$GITHUB_WORKSPACE/build.log" 2>/dev/null || true
+          echo "退出码 vmlinux=$RC1 modules=$RC2 bzImage=$RC3"
           ls -lh vmlinux arch/x86/boot/bzImage 2>&1 || true
-
           if [ "$RC1" -ne 0 ] || [ "$RC2" -ne 0 ] || [ "$RC3" -ne 0 ]; then
-            echo "::error::编译失败 vmlinux=$RC1 modules=$RC2 bzImage=$RC3"
+            echo "::error::编译失败（见坑 1：必须 vmlinux → modules → bzImage 三步）"
             exit 1
           fi
           echo "编译完成：$(date -u)"
@@ -365,28 +286,17 @@ jobs:
         if: failure()
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          echo "=== 编译产物与配置状态 ==="
-          ls -l .config 2>&1 | head -2
-          ls -l include/config/auto.conf include/generated/autoconf.h 2>&1 | head -3
-          ls -l vmlinux arch/x86/boot/bzImage 2>&1 | head -3
-          echo
-
+          ls -l .config include/config/auto.conf 2>&1 | head -3
           LOG="$GITHUB_WORKSPACE/build.log"
-          [ -f "$LOG" ] || { echo "::warning::未生成 build.log"; exit 0; }
-          echo "build.log 字节数: $(stat -c%s "$LOG" 2>/dev/null)"
-          echo "=== build.log 全文（内容通常很短，直接打出）==="
-          cat "$LOG"
-          echo
+          [ -f "$LOG" ] || { echo "::warning::无 build.log"; exit 0; }
           echo "=== 典型错误行 ==="
-          grep -nE "error:|Error [0-9]+|undefined reference|No such file|fatal error|Killed" "$LOG" \
-            | head -60 || echo "(未匹配到典型错误关键词，请看下方日志尾部)"
-          echo
-          echo "=== 日志末尾 80 行 ==="
-          tail -80 "$LOG"
+          grep -nE "error:|Error [0-9]+|undefined reference|No such file|fatal error|Killed" "$LOG" | head -40
+          echo "=== 日志末尾 120 行 ==="
+          tail -120 "$LOG"
 
       - name: 上传编译日志
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: build-log
           path: ${{ github.workspace }}/build.log
@@ -400,14 +310,12 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp arch/x86/boot/bzImage "$GITHUB_WORKSPACE/out/kernel-$(make kernelversion)"
           make ARCH=x86_64 modules_install INSTALL_MOD_PATH="$GITHUB_WORKSPACE/out/modules"
-          cd "$GITHUB_WORKSPACE/out"
-          cp "$KERNEL_DIR/.config" ./config-used.txt
-          tar czf modules.tar.gz -C modules .
+          cp "$KERNEL_DIR/.config" "$GITHUB_WORKSPACE/out/config-used.txt"
+          cd "$GITHUB_WORKSPACE/out" && tar czf modules.tar.gz -C modules . && rm -rf modules
           ls -lh
-          du -sh .
 
       - name: 上传 Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bliss-kernel-sukisu
           path: out/
@@ -415,18 +323,20 @@ jobs:
 
       - name: 发布到 Releases
         if: ${{ inputs.publish_release }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag_name }}
           name: Bliss Kernel + SukiSU Ultra (${{ inputs.kernel_branch }})
           body: |
             分支 `${{ inputs.kernel_branch }}` / defconfig `${{ inputs.defconfig }}`
             - SukiSU Ultra: `${{ inputs.sukisu_ref }}`
-            - KPM: ${{ inputs.enable_kpm }}
-            - SUSFS: ${{ inputs.enable_susfs }}（非 GKI 内核不保证成功）
+            - KPM: ${{ inputs.enable_kpm }} / SUSFS: ${{ inputs.enable_susfs }}（非 GKI 不保证成功）
+            - Intel AX200(iwlwifi) 内置: ${{ inputs.ax200_builtin }}
+            - 内置启动参数: `${{ inputs.extra_cmdline }}`（空表示未写入）
 
-            用法：`kernel` 替换 Bliss OS ISO 里的 `kernel` 文件，
+            用法：`kernel-*` 替换 Bliss OS ISO 根目录的 `kernel`；
             `modules.tar.gz` 解包后替换 `system.efs` 内 `/lib/modules/<版本>/`。
+            若开启了 AX200 内置，固件已编进 vmlinux，无需再往 /vendor/firmware 放 .ucode。
           files: out/*
           prerelease: true
         env:
