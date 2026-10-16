@@ -1,0 +1,188 @@
+name: Build Bliss OS 18 (voyager-x86)
+
+# AOSP 完整编译：需 ~400GB 磁盘 + 数小时，GitHub 托管 runner（14GB / 6h）跑不动，
+# 只能用自托管 runner。若误用托管 runner，"环境自检"会直接拦下。
+# 官方明确排除 Ubuntu 24.04+（装不上 libncurses5），runner 必须是 22.04。
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_variant:
+        description: 'BLISS_BUILD_VARIANT'
+        required: true
+        default: 'foss'
+        type: choice
+        options: [vanilla, foss, gapps]
+      sync_depth:
+        description: 'repo sync 深度（1=浅克隆，0=完整历史）'
+        required: true
+        default: '1'
+      use_aosp_mirror:
+        description: '清华 AOSP 镜像（国内必开）'
+        type: boolean
+        default: true
+      github_proxy:
+        description: 'GitHub 代理前缀，留空直连。例：https://gh.example.com/https://github.com/'
+        required: false
+        default: ''
+      publish_release:
+        description: '编译成功后发布到 Releases'
+        type: boolean
+        default: true
+      tag_name:
+        description: 'Release 标签'
+        required: true
+        default: 'bliss18-autobuild'
+
+permissions:
+  contents: write
+
+env:
+  SRC_DIR:       ${{ github.workspace }}/bliss18
+  BLISS_BRANCH:  voyager-x86
+  LUNCH_TARGET:  bliss_x86_64-userdebug
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 2160   # 36 小时，自托管不受 6 小时限制
+
+    steps:
+      - name: 环境自检
+        run: |
+          echo "CPU $(nproc) 核"; free -g | head -2; df -h "$GITHUB_WORKSPACE" || df -h .
+          AVAIL=$(df --output=avail -BG "$GITHUB_WORKSPACE" 2>/dev/null | tail -1 | tr -dc '0-9')
+          AVAIL=${AVAIL:-0}
+          echo "可用空间: ${AVAIL} GB"
+          if [ "$AVAIL" -lt 350 ]; then
+            echo "::error::磁盘 ${AVAIL}GB < 350GB，无法编译 AOSP。需 >=400GB 磁盘、>=16GB 内存（推荐 32GB）。"
+            exit 1
+          fi
+          [ "$AVAIL" -lt 400 ] && echo "::warning::低于建议的 400GB，中途可能因空间不足失败"
+          MEM=$(free -g | awk '/^Mem:/{print $2}')
+          [ "${MEM:-0}" -lt 16 ] && echo "::warning::内存 ${MEM}GB 偏低，链接阶段易 OOM"
+          exit 0
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            git-core gnupg flex bison gperf build-essential zip curl zlib1g-dev \
+            gcc-multilib g++-multilib libc6-dev-i386 lib32ncurses5-dev \
+            x11proto-core-dev libx11-dev lib32z-dev ccache libgl1-mesa-dev \
+            libxml2-utils xsltproc unzip squashfs-tools python3-mako libssl-dev \
+            ninja-build lunzip syslinux syslinux-utils gettext genisoimage bc \
+            xorriso xmlstarlet meson glslang-tools git-lfs libncurses5 \
+            libncurses5:i386 libelf-dev aapt zstd rdfind nasm rustc bindgen \
+            rsync wget pkg-config openjdk-17-jdk xz-utils
+          java -version 2>&1 | head -1
+
+      - name: 配置 git 身份、镜像加速与 repo 工具
+        env:
+          USE_MIRROR: ${{ inputs.use_aosp_mirror }}
+          GH_PROXY:   ${{ inputs.github_proxy }}
+        run: |
+          git config --global user.email "builder@github-actions.local"
+          git config --global user.name  "GitHub Actions Builder"
+          git config --global --add safe.directory '*'
+
+          [ "$USE_MIRROR" = "true" ] \
+            && git config --global url."https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/".insteadOf "https://android.googlesource.com/" \
+            && echo "已启用清华 AOSP 镜像"
+          [ -n "$GH_PROXY" ] \
+            && git config --global url."${GH_PROXY%/}/".insteadOf "https://github.com/" \
+            && echo "已启用 GitHub 代理: $GH_PROXY"
+          git config --global --get-regexp 'url\.' || true
+
+          mkdir -p "$HOME/bin"
+          curl -sSL https://mirrors.tuna.tsinghua.edu.cn/git/git-repo -o "$HOME/bin/repo" \
+            || curl -sSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod a+x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          echo "REPO_URL=https://mirrors.tuna.tsinghua.edu.cn/git/git-repo" >> "$GITHUB_ENV"
+
+      - name: repo init
+        run: |
+          mkdir -p "$SRC_DIR" && cd "$SRC_DIR"
+          DEPTH_ARG=""
+          [ "${{ inputs.sync_depth }}" != "0" ] && DEPTH_ARG="--depth=${{ inputs.sync_depth }}"
+          repo init -u https://github.com/BlissOS/platform_manifest -b "$BLISS_BRANCH" $DEPTH_ARG
+
+      - name: repo sync
+        run: |
+          cd "$SRC_DIR"
+          JOBS=$(( $(nproc) * 4 ))      # 网络 I/O 密集，可远超核数
+          [ "$JOBS" -gt 32 ] && JOBS=32
+          [ "$JOBS" -lt 8 ]  && JOBS=8
+          echo "并发: $JOBS"
+          repo sync -c --no-clone-bundle -j"$JOBS" --optimized-fetch --prune --force-sync
+        timeout-minutes: 720
+
+      - name: 编译 ISO
+        env:
+          VARIANT: ${{ inputs.build_variant }}
+        run: |
+          cd "$SRC_DIR"
+          . build/envsetup.sh
+          export BLISS_BUILD_VARIANT="$VARIANT"
+          lunch "$LUNCH_TARGET"
+
+          # 内存不足时降并发，避免链接阶段 OOM
+          MEM=$(free -g | awk '/^Mem:/{print $2}')
+          J=$(nproc)
+          if [ "$MEM" -lt 32 ]; then
+            J=$(( MEM / 2 )); [ "$J" -lt 2 ] && J=2
+            echo "内存 ${MEM}GB，并发限制为 $J"
+          fi
+          make iso_img -j"$J"
+        timeout-minutes: 2160
+
+      - name: 收集并打包产物
+        run: |
+          cd "$SRC_DIR"
+          ISO=$(find out/target/product -maxdepth 2 -name '*.iso' -type f | head -1)
+          [ -n "$ISO" ] || {
+            echo "::error::未找到 ISO 产物"; find out/target/product -maxdepth 2 -name '*.img' | head -20; exit 1; }
+
+          STAMP=$(date +%Y%m%d-%H%M)
+          BASE="BlissOS18-${{ inputs.build_variant }}-${STAMP}"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$ISO" "$GITHUB_WORKSPACE/out/${BASE}.iso"
+          cd "$GITHUB_WORKSPACE/out"
+
+          # Releases 单文件上限 2GB：先 xz 压，仍超限再分片
+          LIMIT=1900000000
+          if [ "$(stat -c%s "${BASE}.iso")" -gt "$LIMIT" ]; then
+            echo "ISO 超过 2GB 限制，xz 压缩中..."
+            xz -T0 -1 -c "${BASE}.iso" > "${BASE}.iso.xz" && rm -f "${BASE}.iso"
+            if [ "$(stat -c%s "${BASE}.iso.xz")" -gt "$LIMIT" ]; then
+              echo "压缩后仍超限，1.9GB 分片..."
+              split -d -b 1900M -a 2 "${BASE}.iso.xz" "${BASE}.iso.xz.part" && rm -f "${BASE}.iso.xz"
+            fi
+          fi
+          # 注意排除自身：重定向会先创建 .sha256 文件，* 展开时它已经存在
+          for f in *; do [ "$f" = "${BASE}.sha256" ] || sha256sum "$f"; done > "${BASE}.sha256"
+          echo "--- 最终产物 ---"; ls -lh
+
+      - name: 发布到 Releases
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          name: Bliss OS 18 (${{ inputs.build_variant }}) - ${{ github.run_number }}
+          body: |
+            自动化构建：Bliss OS 18 / voyager-x86 / Android 15
+            - 构建变体：${{ inputs.build_variant }}
+            - lunch：${{ env.LUNCH_TARGET }}
+            - 提交：${{ github.sha }}
+
+            **若产物被分片**，下载后合并：
+            ```
+            cat BlissOS18-*.xz.part* > image.iso.xz && xz -d image.iso.xz
+            ```
+            校验：`sha256sum -c *.sha256`
+          files: out/*
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
