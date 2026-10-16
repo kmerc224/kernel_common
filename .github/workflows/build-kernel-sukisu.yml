@@ -67,8 +67,20 @@ on:
         description: '【高风险】尝试合入 SUSFS，非 GKI 内核大概率失败'
         type: boolean
         default: false
+      base_iso_url:
+        description: '底包 ISO 下载 URL。填了会在编完内核后直接打包成成品 ISO（需 self-hosted runner，磁盘 ≥25GB）'
+        required: false
+        default: ''
+      vmware_tweaks:
+        description: '打包时注入 VMware 优化启动项（依赖 base_iso_url）'
+        type: boolean
+        default: true
+      iso_out_name:
+        description: '成品 ISO 文件名（不含 .iso）'
+        required: false
+        default: 'BlissOS-SukiSU'
       publish_release:
-        description: '发布到 Releases'
+        description: '发布到 Releases（成品 ISO 体积过大，不发布也不上传）'
         type: boolean
         default: false
       tag_name:
@@ -94,8 +106,16 @@ jobs:
       - name: 依赖与磁盘自检
         run: |
           AVAIL=$(df --output=avail -BG "$GITHUB_WORKSPACE" | tail -1 | tr -dc '0-9')
-          echo "可用 ${AVAIL:-0}GB / CPU $(nproc) 核"
-          [ "${AVAIL:-0}" -lt 12 ] && { echo "::error::磁盘不足，请改 self-hosted runner"; exit 1; }
+          AVAIL=${AVAIL:-0}
+          NEED=12
+          # 打包成品 ISO 要额外 10GB 以上（底包 + 解包 + 重打包 + 成品）
+          if [ -n "${{ inputs.base_iso_url }}" ]; then NEED=25; fi
+          echo "可用 ${AVAIL}GB / CPU $(nproc) 核 / 本次需求 ${NEED}GB"
+          if [ "$AVAIL" -lt "$NEED" ]; then
+            echo "::error::磁盘不足（${AVAIL}GB < ${NEED}GB）。"
+            echo "::error::填了 base_iso_url 就必须用磁盘够大的 self-hosted runner。"
+            exit 1
+          fi
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
             git build-essential libssl-dev libelf-dev bc flex bison ccache \
@@ -153,8 +173,12 @@ jobs:
 
           # 驱动内置化：这些本来就在源码树里，defconfig 全设成了 =m，
           # 运行时没加载就表现为网卡不通 / 鼠标不动。改 =y 摆脱模块加载依赖。
-          for s in CONFIG_HYPERVISOR_GUEST CONFIG_VMXNET3 CONFIG_VMWARE_VMCI \
-                   CONFIG_VMWARE_BALLOON CONFIG_DRM_VMWGFX \
+          # 分两组：通用 VMware guest 驱动 + 通用输入设备
+          # CONFIG_VMWARE_PVSCSI 是准虚拟 SCSI 控制器驱动，默认 defconfig 里没有。
+          # 缺了它，VMware 的磁盘只能用 LSI Logic（通用驱动），I/O 慢一截。
+          for s in CONFIG_HYPERVISOR_GUEST CONFIG_PARAVIRT CONFIG_PARAVIRT_SPINLOCKS \
+                   CONFIG_VMXNET3 CONFIG_VMWARE_VMCI CONFIG_VMWARE_VMCI_VSOCKETS \
+                   CONFIG_VMWARE_BALLOON CONFIG_VMWARE_PVSCSI CONFIG_DRM_VMWGFX \
                    CONFIG_E1000 CONFIG_E1000E \
                    CONFIG_MOUSE_PS2 CONFIG_KEYBOARD_ATKBD CONFIG_INPUT_EVDEV \
                    CONFIG_HID_GENERIC CONFIG_USB_HID CONFIG_HID_MULTITOUCH; do
@@ -413,11 +437,49 @@ jobs:
           cd "$GITHUB_WORKSPACE/out" && tar czf modules.tar.gz -C modules . && rm -rf modules
           ls -lh
 
+      - name: 检出本仓库（取打包脚本）
+        if: ${{ inputs.base_iso_url != '' }}
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: 打包成品 ISO
+        if: ${{ inputs.base_iso_url != '' }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          echo "下载底包: ${{ inputs.base_iso_url }}"
+          curl -fL --retry 3 --retry-delay 5 -o base.iso "${{ inputs.base_iso_url }}"
+          ls -lh base.iso
+
+          KREL=$(ls out/kernel-* 2>/dev/null | head -1 | sed 's#.*/kernel-##')
+          echo "内核版本: ${KREL:-未取到}"
+          if [ -z "$KREL" ] || [ ! -f "out/kernel-$KREL" ]; then
+            echo "::error::找不到 kernel 产物"; exit 1
+          fi
+          if [ ! -f out/modules.tar.gz ]; then
+            echo "::error::找不到 modules.tar.gz"; exit 1
+          fi
+
+          VMWARE_ARG=""
+          if [ "${{ inputs.vmware_tweaks }}" = "true" ]; then VMWARE_ARG="--vmware"; fi
+          chmod +x repo/make-bliss-vmware-iso.sh
+          ./repo/make-bliss-vmware-iso.sh \
+            base.iso "out/kernel-$KREL" out/modules.tar.gz \
+            "out/${{ inputs.iso_out_name }}.iso" $VMWARE_ARG
+
+          echo "=== 成品 ISO ==="
+          ls -lh "out/${{ inputs.iso_out_name }}.iso"
+          echo "成品留在 runner 本机: $GITHUB_WORKSPACE/out/${{ inputs.iso_out_name }}.iso"
+          echo "（体积过大，不进 Artifacts 也不进 Releases，请到 runner 机器上取）"
+        timeout-minutes: 180
+
       - name: 上传 Artifacts
         uses: actions/upload-artifact@v7
         with:
           name: bliss-kernel-sukisu
-          path: out/
+          path: |
+            out/
+            !out/*.iso
           retention-days: 30
 
       - name: 发布到 Releases
@@ -436,7 +498,9 @@ jobs:
             用法：`kernel-*` 替换 Bliss OS ISO 根目录的 `kernel`；
             `modules.tar.gz` 解包后替换 `system.efs` 内 `/lib/modules/<版本>/`。
             若开启了 AX200 内置，固件已编进 vmlinux，无需再往 /vendor/firmware 放 .ucode。
-          files: out/*
+          files: |
+            out/*
+            !out/*.iso
           prerelease: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
