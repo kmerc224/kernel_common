@@ -39,10 +39,22 @@ on:
         description: 'SukiSU-Ultra 分支或 tag'
         required: true
         default: 'main'
-      extra_cmdline:
-        description: '内置启动参数（追加）。⚠️ 裸机装机请清空：nomodeset 会关掉 i915 硬解'
+      runner:
+        description: 'runner 标签。想提速可填 ubuntu-22.04-8core / -16core（larger runner，需付费额度）'
         required: false
-        default: 'nomodeset'
+        default: 'ubuntu-22.04'
+      use_ccache:
+        description: '启用 ccache 并跨运行复用缓存（第二次起大幅提速，首次无收益）'
+        type: boolean
+        default: true
+      slim_build:
+        description: '【有风险】裁剪无关驱动（AMD/N卡/非Intel网卡/FireWire/InfiniBand/冷门文件系统）以缩短编译'
+        type: boolean
+        default: false
+      extra_cmdline:
+        description: '内置启动参数（追加，不覆盖引导器参数）。裸机装机留空；仅虚拟机排障时填 nomodeset'
+        required: false
+        default: ''
       ax200_builtin:
         description: 'Intel AX200 驱动+固件编进内核（裸机用；纯虚拟机可关）'
         type: boolean
@@ -71,10 +83,11 @@ env:
   KERNEL_DIR: ${{ github.workspace }}/kernel
   SUKISU_DIR: ${{ github.workspace }}/SukiSU-Ultra
   FW_DIR:     ${{ github.workspace }}/firmware
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 350
 
     steps:
@@ -94,6 +107,16 @@ jobs:
           git clone --depth 1 -b "${{ inputs.kernel_branch }}" \
             https://github.com/android-generic/kernel_common.git "$KERNEL_DIR"
           cd "$KERNEL_DIR" && make kernelversion
+
+      - name: 恢复 ccache 缓存
+        if: ${{ inputs.use_ccache }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          # 主 key 带 run_id：每次保存一份新缓存；靠 restore-keys 命中最近一次
+          key: ccache-${{ inputs.kernel_branch }}-${{ inputs.defconfig }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ inputs.kernel_branch }}-${{ inputs.defconfig }}-
 
       - name: 移除自带 KernelSU
         working-directory: ${{ env.KERNEL_DIR }}
@@ -137,6 +160,34 @@ jobs:
                    CONFIG_HID_GENERIC CONFIG_USB_HID CONFIG_HID_MULTITOUCH; do
             ./scripts/config --enable "$s" || echo "::warning::$s 无此符号，跳过"
           done
+
+          # 【可选】裁剪无关驱动，直接减少要编译的目标数（最实在的提速）
+          # 风险自负：下面全是你这台机器用不到的东西，但别的机器可能需要。
+          # 保留：Intel 网卡(E1000/E1000E)、Intel 无线(IWLWIFI)、VMware(VMXNET3/VMWGFX)、
+          #       i915、HDA 声卡、USB、ext4/ntfs3/f2fs。
+          if [ "${{ inputs.slim_build }}" = "true" ]; then
+            for s in \
+              CONFIG_DRM_RADEON CONFIG_DRM_AMDGPU CONFIG_DRM_NOUVEAU CONFIG_DRM_MGAG200 \
+              CONFIG_DRM_AST CONFIG_DRM_GMA500 CONFIG_DRM_UDL \
+              CONFIG_FIREWIRE CONFIG_FIREWIRE_OHCI CONFIG_FIREWIRE_SBP2 \
+              CONFIG_INFINIBAND CONFIG_ISCSI_TCP CONFIG_SCSI_ISCSI_ATTRS CONFIG_SCSI_DEBUG \
+              CONFIG_WLAN_VENDOR_ATH CONFIG_WLAN_VENDOR_ATMEL CONFIG_WLAN_VENDOR_BROADCOM \
+              CONFIG_WLAN_VENDOR_CISCO CONFIG_WLAN_VENDOR_INTERSIL CONFIG_WLAN_VENDOR_MARVELL \
+              CONFIG_WLAN_VENDOR_MEDIATEK CONFIG_WLAN_VENDOR_QUANTENNA CONFIG_WLAN_VENDOR_RALINK \
+              CONFIG_WLAN_VENDOR_REALTEK CONFIG_WLAN_VENDOR_RSI CONFIG_WLAN_VENDOR_ST \
+              CONFIG_WLAN_VENDOR_TI CONFIG_WLAN_VENDOR_ZYDAS CONFIG_WLAN_VENDOR_MICROCHIP \
+              CONFIG_NET_VENDOR_3COM CONFIG_NET_VENDOR_AMD CONFIG_NET_VENDOR_AQUANTIA \
+              CONFIG_NET_VENDOR_ATHEROS CONFIG_NET_VENDOR_BROCADE CONFIG_NET_VENDOR_CAVIUM \
+              CONFIG_NET_VENDOR_CHELSIO CONFIG_NET_VENDOR_EMULEX CONFIG_NET_VENDOR_HISILICON \
+              CONFIG_NET_VENDOR_MARVELL CONFIG_NET_VENDOR_MELLANOX CONFIG_NET_VENDOR_NVIDIA \
+              CONFIG_NET_VENDOR_QLOGIC CONFIG_NET_VENDOR_SOLARFLARE CONFIG_NET_VENDOR_TEHUTI \
+              CONFIG_NET_VENDOR_TI CONFIG_NET_VENDOR_VIA CONFIG_NET_VENDOR_XILINX \
+              CONFIG_BTRFS_FS CONFIG_XFS_FS CONFIG_JFS_FS CONFIG_REISERFS_FS \
+              CONFIG_GFS2_FS CONFIG_OCFS2_FS CONFIG_NILFS2_FS CONFIG_UFS_FS; do
+              ./scripts/config --disable "$s" || true
+            done
+            echo "已裁剪无关驱动（slim_build）"
+          fi
 
           # cmdline 只追加不覆盖（见坑 6）
           if [ -n "${{ inputs.extra_cmdline }}" ]; then
@@ -265,15 +316,33 @@ jobs:
       - name: 编译内核
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          echo "开始编译：$(date -u)  $(nproc) 核"
+          # ccache：把 /usr/lib/ccache 前置到 PATH，make 里的 gcc 就自动走 ccache。
+          # 关掉 CONFIG_DEBUG_INFO 后产物不含绝对路径，跨目录命中率很高。
+          if [ "${{ inputs.use_ccache }}" = "true" ]; then
+            export PATH="/usr/lib/ccache:$PATH"
+            export CCACHE_MAXSIZE=2G
+            ccache -M 2G
+            ccache -z            # 清零统计，方便看本次命中率
+            echo "ccache: $(command -v gcc) -> $(readlink -f "$(command -v gcc)")"
+          fi
+          # 并发：内核编译 I/O 与 CPU 混合，2 倍核数通常更快；上限 12 防内存爆
+          J=$(( $(nproc) * 2 )); [ "$J" -gt 12 ] && J=12
+          echo "开始编译：$(date -u)  $(nproc) 核 / -j$J / ccache=${{ inputs.use_ccache }}"
+
           set +e   # 手动接管错误码，保证日志合并一定执行得到（见坑 2）
-          make ARCH=x86_64 -j$(nproc) vmlinux 2>&1 | tee "$GITHUB_WORKSPACE/build-vmlinux.log"; RC1=${PIPESTATUS[0]}
-          make ARCH=x86_64 -j$(nproc) modules 2>&1 | tee "$GITHUB_WORKSPACE/build-modules.log"; RC2=${PIPESTATUS[0]}
-          make ARCH=x86_64 -j$(nproc) bzImage 2>&1 | tee "$GITHUB_WORKSPACE/build-bzimage.log"; RC3=${PIPESTATUS[0]}
+          T0=$(date +%s)
+          make ARCH=x86_64 -j"$J" vmlinux 2>&1 | tee "$GITHUB_WORKSPACE/build-vmlinux.log"; RC1=${PIPESTATUS[0]}
+          T1=$(date +%s); echo ">> vmlinux 阶段耗时 $(( T1 - T0 ))s"
+          make ARCH=x86_64 -j"$J" modules 2>&1 | tee "$GITHUB_WORKSPACE/build-modules.log"; RC2=${PIPESTATUS[0]}
+          T2=$(date +%s); echo ">> modules 阶段耗时 $(( T2 - T1 ))s"
+          make ARCH=x86_64 -j"$J" bzImage 2>&1 | tee "$GITHUB_WORKSPACE/build-bzimage.log"; RC3=${PIPESTATUS[0]}
+          echo ">> bzImage 阶段耗时 $(( $(date +%s) - T2 ))s / 总计 $(( $(date +%s) - T0 ))s"
+
           cat "$GITHUB_WORKSPACE"/build-vmlinux.log \
               "$GITHUB_WORKSPACE"/build-modules.log \
               "$GITHUB_WORKSPACE"/build-bzimage.log > "$GITHUB_WORKSPACE/build.log" 2>/dev/null || true
           echo "退出码 vmlinux=$RC1 modules=$RC2 bzImage=$RC3"
+          [ "${{ inputs.use_ccache }}" = "true" ] && ccache -s
           ls -lh vmlinux arch/x86/boot/bzImage 2>&1 || true
           if [ "$RC1" -ne 0 ] || [ "$RC2" -ne 0 ] || [ "$RC3" -ne 0 ]; then
             echo "::error::编译失败（见坑 1：必须 vmlinux → modules → bzImage 三步）"
@@ -294,6 +363,14 @@ jobs:
           echo "=== 日志末尾 120 行 ==="
           tail -120 "$LOG"
 
+      # 用 always()：编译失败时缓存里的部分结果下次一样能用
+      - name: 保存 ccache 缓存
+        if: ${{ always() && inputs.use_ccache }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ inputs.kernel_branch }}-${{ inputs.defconfig }}-${{ github.run_id }}
+
       - name: 上传编译日志
         if: always()
         uses: actions/upload-artifact@v7
@@ -308,8 +385,30 @@ jobs:
         run: |
           test -f arch/x86/boot/bzImage || { echo "::error::未生成 bzImage"; exit 1; }
           mkdir -p "$GITHUB_WORKSPACE/out"
-          cp arch/x86/boot/bzImage "$GITHUB_WORKSPACE/out/kernel-$(make kernelversion)"
-          make ARCH=x86_64 modules_install INSTALL_MOD_PATH="$GITHUB_WORKSPACE/out/modules"
+          # 用 kernelrelease 而不是 kernelversion：前者带 -gloria-xanmod1 之类的
+          # localversion 后缀，跟 /lib/modules/ 下的目录名一致，排查版本错配对得上。
+          KREL=$(make -s kernelrelease)
+          echo "内核版本: $KREL"
+          cp arch/x86/boot/bzImage "$GITHUB_WORKSPACE/out/kernel-$KREL"
+
+          # vmlinux：未压缩 ELF + 符号表，gdb 定位 oops 用。
+          # 注意 CONFIG_DEBUG_INFO 已关，不含 DWARF，只有符号没有源码行号。
+          # 约 40MB，压完 ~10MB。
+          # 用 if 而不是 `[ -f x ] && cmd`：GitHub 的 run 默认带 -e，
+          # 短路返回非 0 会让整个步骤直接失败。
+          if [ -f vmlinux ]; then
+            xz -T0 -1 -c vmlinux > "$GITHUB_WORKSPACE/out/vmlinux-$KREL.xz"
+          else
+            echo "::warning::未找到 vmlinux，跳过"
+          fi
+          # System.map：纯文本符号地址表，比 vmlinux 轻得多，查 panic 基本够用
+          if [ -f System.map ]; then
+            cp System.map "$GITHUB_WORKSPACE/out/System.map-$KREL"
+          fi
+
+          # INSTALL_MOD_STRIP=1：去掉模块符号表，产物体积减半（不影响加载）
+          make ARCH=x86_64 modules_install INSTALL_MOD_PATH="$GITHUB_WORKSPACE/out/modules" \
+               INSTALL_MOD_STRIP=1
           cp "$KERNEL_DIR/.config" "$GITHUB_WORKSPACE/out/config-used.txt"
           cd "$GITHUB_WORKSPACE/out" && tar czf modules.tar.gz -C modules . && rm -rf modules
           ls -lh
